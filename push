@@ -1,0 +1,10 @@
+#!/bin/bash
+
+rm requirements.txt
+.venv/bin/pip freeze >> requirements.txt
+
+echo "Generated requirements.txt"
+
+git add .
+git commit -m "$1"
+git push
