@@ -54,6 +54,7 @@ python stabilize_nadir.py \
     --crf 0 \
     --scale 0.5 \
     --smooth 0 \
+    --devices cuda:0 cuda:1 \
     --tracks
 """
 
@@ -61,9 +62,12 @@ from __future__ import annotations
 
 import argparse
 import math
+import queue
 import shutil
 import subprocess
 import sys
+import threading
+import traceback
 from collections import deque
 from pathlib import Path
 
@@ -424,10 +428,55 @@ def build_parser() -> argparse.ArgumentParser:
     # ----------------------------------------------------------------------
     # Device / numerical
     # ----------------------------------------------------------------------
-    parser.add_argument(
+    device_group = parser.add_mutually_exclusive_group()
+    device_group.add_argument(
+        "--devices",
+        nargs="+",
+        default=None,
+        metavar="DEVICE",
+        help=(
+            "Inference devices. Example: --devices cuda:0 cuda:1. "
+            "Defaults to cuda:0 cuda:1."
+        ),
+    )
+    device_group.add_argument(
         "--device",
-        default="cuda:0",
-        help="Torch device.",
+        dest="legacy_devices",
+        nargs="+",
+        default=None,
+        metavar="DEVICE",
+        help=(
+            "Backward-compatible alias for --devices. It also accepts "
+            "multiple devices, e.g. --device cuda:0 cuda:1, and a quoted "
+            "value such as --device 'cuda:0 cuda:1'."
+        ),
+    )
+    parser.add_argument(
+        "--gpu-workers",
+        type=int,
+        default=1,
+        help=(
+            "Persistent inference workers per device. Each worker owns its "
+            "own SuperPoint + LightGlue model pair."
+        ),
+    )
+    parser.add_argument(
+        "--prefetch",
+        type=int,
+        default=4,
+        help=(
+            "Maximum queued sampled frames per inference worker. "
+            "This bounds CPU RAM while keeping both GPUs fed."
+        ),
+    )
+    parser.add_argument(
+        "--pin-memory",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Pin CPU image tensors before CUDA transfer and use "
+            "non-blocking host-to-device copies."
+        ),
     )
     parser.add_argument(
         "--amp",
@@ -464,7 +513,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--codec",
-        default="libx264",
+        default="hvec_nvenc",
         help="Stabilized video codec.",
     )
     parser.add_argument(
@@ -556,7 +605,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--viz-codec",
-        default="libx264",
+        default="hvec_nvenc",
         help="Diagnostic/track visualization video codec.",
     )
     parser.add_argument(
@@ -639,6 +688,54 @@ def validate_args(
     parser: argparse.ArgumentParser,
     args: argparse.Namespace,
 ) -> None:
+    raw_devices = (
+        args.devices
+        if args.devices is not None
+        else args.legacy_devices
+    )
+
+    if raw_devices is None:
+        raw_devices = [
+            "cuda:0",
+            "cuda:1",
+        ]
+
+    normalized_devices = []
+
+    for raw_device in raw_devices:
+        # Accept all of:
+        #   --devices cuda:0 cuda:1
+        #   --device cuda:0 cuda:1
+        #   --device "cuda:0 cuda:1"
+        #   --devices "cuda:0,cuda:1"
+        pieces = str(
+            raw_device
+        ).replace(
+            ",",
+            " ",
+        ).split()
+
+        normalized_devices.extend(
+            pieces
+        )
+
+    if not normalized_devices:
+        parser.error(
+            "At least one device must be specified."
+        )
+
+    args.devices = normalized_devices
+
+    if args.gpu_workers < 1:
+        parser.error(
+            "--gpu-workers must be >= 1."
+        )
+
+    if args.prefetch < 1:
+        parser.error(
+            "--prefetch must be >= 1."
+        )
+
     if args.step < 1:
         parser.error("--step must be >= 1.")
     if args.reference_frame < 0:
@@ -1245,6 +1342,41 @@ def resolve_device(
     return device
 
 
+def resolve_devices(
+    requested_devices: list[str],
+) -> list[torch.device]:
+    devices = []
+
+    for requested in requested_devices:
+        device = resolve_device(
+            requested
+        )
+        devices.append(
+            device
+        )
+
+    canonical = [
+        str(
+            device
+        )
+        for device in devices
+    ]
+
+    if len(
+        canonical
+    ) != len(
+        set(
+            canonical
+        )
+    ):
+        raise ValueError(
+            "Duplicate entries in --devices are not useful. "
+            "Use --gpu-workers to create multiple workers per device."
+        )
+
+    return devices
+
+
 def get_video_metadata(
     video_path: Path,
 ) -> dict:
@@ -1376,19 +1508,32 @@ def resize_for_inference(
 def bgr_to_tensor(
     frame_bgr: np.ndarray,
     device: torch.device,
+    pin_memory: bool,
 ) -> torch.Tensor:
     frame_rgb = cv2.cvtColor(
         frame_bgr,
         cv2.COLOR_BGR2RGB,
     )
 
-    tensor = (
+    tensor_cpu = (
         torch.from_numpy(frame_rgb)
         .permute(2, 0, 1)
         .contiguous()
         .float()
         .div_(255.0)
-        .to(device)
+    )
+
+    use_pinned = (
+        pin_memory
+        and device.type == "cuda"
+    )
+
+    if use_pinned:
+        tensor_cpu = tensor_cpu.pin_memory()
+
+    tensor = tensor_cpu.to(
+        device,
+        non_blocking=use_pinned,
     )
 
     return tensor
@@ -1447,10 +1592,12 @@ def extract_features(
     extractor,
     frame_scaled: np.ndarray,
     device: torch.device,
+    pin_memory: bool,
 ):
     image = bgr_to_tensor(
         frame_scaled,
         device,
+        pin_memory,
     )
 
     with torch.inference_mode():
@@ -1578,6 +1725,7 @@ def match_sample_to_reference(
         extractor,
         frame_scaled,
         device,
+        args.pin_memory,
     )
 
     with torch.inference_mode():
@@ -1875,6 +2023,441 @@ def match_sample_to_reference(
     result["reason"] = "ok"
 
     return result
+
+
+
+# ============================================================================
+# Persistent multi-GPU registration workers
+# ============================================================================
+
+def registration_result_to_record(
+    frame_index: int,
+    result: dict | None,
+    reference_keypoint_count: int,
+    worker_id: int,
+    worker_device: str,
+) -> dict:
+    if result is None:
+        return {
+            "frame_index": int(
+                frame_index
+            ),
+            "valid": True,
+            "reason": "reference identity",
+            "H": np.eye(
+                3,
+                dtype=np.float64,
+            ),
+            "matches": int(
+                reference_keypoint_count
+            ),
+            "inliers": int(
+                reference_keypoint_count
+            ),
+            "inlier_ratio": 1.0,
+            "rms": 0.0,
+            "worker_id": int(
+                worker_id
+            ),
+            "worker_device": str(
+                worker_device
+            ),
+        }
+
+    return {
+        "frame_index": int(
+            frame_index
+        ),
+        "valid": bool(
+            result[
+                "valid"
+            ]
+        ),
+        "reason": str(
+            result[
+                "reason"
+            ]
+        ),
+        "H": (
+            result[
+                "H"
+            ]
+            if result[
+                "H"
+            ] is not None
+            else np.full(
+                (
+                    3,
+                    3,
+                ),
+                np.nan,
+                dtype=np.float64,
+            )
+        ),
+        "matches": int(
+            result[
+                "matches"
+            ]
+        ),
+        "inliers": int(
+            result[
+                "inliers"
+            ]
+        ),
+        "inlier_ratio": float(
+            result[
+                "inlier_ratio"
+            ]
+        ),
+        "rms": float(
+            result[
+                "rms"
+            ]
+        ),
+        "worker_id": int(
+            worker_id
+        ),
+        "worker_device": str(
+            worker_device
+        ),
+    }
+
+
+class RegistrationWorker(
+    threading.Thread,
+):
+    """
+    One persistent SuperPoint + LightGlue model pair.
+
+    Workers share one bounded task queue. Therefore, whichever GPU becomes
+    free first takes the next sampled frame. Each worker independently
+    extracts the fixed reference features on its own device.
+    """
+
+    def __init__(
+        self,
+        worker_id: int,
+        device: torch.device,
+        task_queue: queue.Queue,
+        result_queue: queue.Queue,
+        status_queue: queue.Queue,
+        stop_event: threading.Event,
+        reference_scaled: np.ndarray,
+        args: argparse.Namespace,
+        width: int,
+        height: int,
+    ):
+        super().__init__(
+            name=(
+                f"registration-worker-"
+                f"{worker_id}-"
+                f"{str(device).replace(':', '_')}"
+            ),
+            daemon=True,
+        )
+
+        self.worker_id = int(
+            worker_id
+        )
+        self.device = device
+        self.task_queue = task_queue
+        self.result_queue = result_queue
+        self.status_queue = status_queue
+        self.stop_event = stop_event
+        self.reference_scaled = reference_scaled
+        self.args = args
+        self.width = int(
+            width
+        )
+        self.height = int(
+            height
+        )
+
+    def run(
+        self,
+    ) -> None:
+        device_string = str(
+            self.device
+        )
+
+        try:
+            if self.device.type == "cuda":
+                torch.cuda.set_device(
+                    self.device
+                )
+
+            torch.manual_seed(
+                self.args.torch_seed
+                + self.worker_id
+            )
+
+            extractor, matcher = build_models(
+                self.args,
+                self.device,
+            )
+
+            reference_features = extract_features(
+                extractor,
+                self.reference_scaled,
+                self.device,
+                self.args.pin_memory,
+            )
+
+            reference_unbatched = rbd(
+                reference_features
+            )
+
+            reference_keypoint_count = int(
+                reference_unbatched[
+                    "keypoints"
+                ].shape[
+                    0
+                ]
+            )
+
+            self.status_queue.put(
+                {
+                    "kind": "ready",
+                    "worker_id": self.worker_id,
+                    "device": device_string,
+                    "reference_keypoints": reference_keypoint_count,
+                }
+            )
+
+            while not self.stop_event.is_set():
+                try:
+                    task = self.task_queue.get(
+                        timeout=0.25
+                    )
+                except queue.Empty:
+                    continue
+
+                try:
+                    if task is None:
+                        return
+
+                    frame_index, frame = task
+
+                    result = match_sample_to_reference(
+                        frame=frame,
+                        reference_features=reference_features,
+                        extractor=extractor,
+                        matcher=matcher,
+                        device=self.device,
+                        args=self.args,
+                        width=self.width,
+                        height=self.height,
+                    )
+
+                    self.result_queue.put(
+                        {
+                            "kind": "result",
+                            "worker_id": self.worker_id,
+                            "device": device_string,
+                            "frame_index": int(
+                                frame_index
+                            ),
+                            "frame": frame,
+                            "result": result,
+                        }
+                    )
+
+                except Exception as exc:
+                    self.result_queue.put(
+                        {
+                            "kind": "error",
+                            "worker_id": self.worker_id,
+                            "device": device_string,
+                            "frame_index": (
+                                int(
+                                    task[
+                                        0
+                                    ]
+                                )
+                                if task is not None
+                                else -1
+                            ),
+                            "error": repr(
+                                exc
+                            ),
+                            "traceback": traceback.format_exc(),
+                        }
+                    )
+
+                finally:
+                    self.task_queue.task_done()
+
+        except Exception as exc:
+            self.status_queue.put(
+                {
+                    "kind": "error",
+                    "worker_id": self.worker_id,
+                    "device": device_string,
+                    "error": repr(
+                        exc
+                    ),
+                    "traceback": traceback.format_exc(),
+                }
+            )
+
+
+def start_registration_workers(
+    devices: list[torch.device],
+    args: argparse.Namespace,
+    reference_scaled: np.ndarray,
+    width: int,
+    height: int,
+):
+    total_workers = (
+        len(
+            devices
+        )
+        * args.gpu_workers
+    )
+
+    task_queue = queue.Queue(
+        maxsize=max(
+            1,
+            total_workers
+            * args.prefetch,
+        )
+    )
+    result_queue = queue.Queue()
+    status_queue = queue.Queue()
+    stop_event = threading.Event()
+
+    workers = []
+    worker_id = 0
+
+    for device in devices:
+        for _ in range(
+            args.gpu_workers
+        ):
+            worker = RegistrationWorker(
+                worker_id=worker_id,
+                device=device,
+                task_queue=task_queue,
+                result_queue=result_queue,
+                status_queue=status_queue,
+                stop_event=stop_event,
+                reference_scaled=reference_scaled,
+                args=args,
+                width=width,
+                height=height,
+            )
+
+            worker.start()
+
+            workers.append(
+                worker
+            )
+            worker_id += 1
+
+    ready = {}
+    reference_keypoint_counts = []
+
+    while len(
+        ready
+    ) < total_workers:
+        message = status_queue.get()
+
+        if message[
+            "kind"
+        ] == "error":
+            stop_event.set()
+
+            raise RuntimeError(
+                "Inference worker failed during initialization:\n"
+                f"worker={message['worker_id']} "
+                f"device={message['device']}\n"
+                f"{message['error']}\n"
+                f"{message['traceback']}"
+            )
+
+        ready[
+            int(
+                message[
+                    "worker_id"
+                ]
+            )
+        ] = message
+
+        reference_keypoint_counts.append(
+            int(
+                message[
+                    "reference_keypoints"
+                ]
+            )
+        )
+
+    reference_keypoint_count = int(
+        reference_keypoint_counts[
+            0
+        ]
+    )
+
+    if any(
+        count
+        != reference_keypoint_count
+        for count in reference_keypoint_counts
+    ):
+        print(
+            "WARNING: SuperPoint returned different reference keypoint "
+            "counts across workers:",
+            reference_keypoint_counts,
+        )
+
+    return (
+        workers,
+        task_queue,
+        result_queue,
+        stop_event,
+        ready,
+        reference_keypoint_count,
+    )
+
+
+def stop_registration_workers(
+    workers: list[RegistrationWorker],
+    task_queue: queue.Queue,
+    stop_event: threading.Event,
+    graceful: bool,
+) -> None:
+    if graceful:
+        for _ in workers:
+            task_queue.put(
+                None
+            )
+    else:
+        stop_event.set()
+
+        for _ in workers:
+            try:
+                task_queue.put_nowait(
+                    None
+                )
+            except queue.Full:
+                break
+
+    for worker in workers:
+        worker.join(
+            timeout=10.0
+        )
+
+    still_alive = [
+        worker.name
+        for worker in workers
+        if worker.is_alive()
+    ]
+
+    if still_alive and graceful:
+        stop_event.set()
+        raise RuntimeError(
+            "Inference worker(s) did not shut down cleanly: "
+            + ", ".join(
+                still_alive
+            )
+        )
 
 
 # ============================================================================
@@ -3401,8 +3984,8 @@ def main() -> None:
         args.matmul_precision
     )
 
-    device = resolve_device(
-        args.device
+    devices = resolve_devices(
+        args.devices
     )
 
     metadata = get_video_metadata(
@@ -3444,11 +4027,39 @@ def main() -> None:
     print("Motion model:", args.motion_model)
     print("Smooth radius:", args.smooth)
     print("Border mode:", args.border_mode)
-    print("Device:", device)
+    print(
+        "Devices:",
+        " ".join(
+            str(
+                device
+            )
+            for device in devices
+        ),
+    )
+    print(
+        "Workers per device:",
+        args.gpu_workers,
+    )
+    print(
+        "Total inference workers:",
+        len(
+            devices
+        )
+        * args.gpu_workers,
+    )
+    print(
+        "Prefetch per worker:",
+        args.prefetch,
+    )
+    print(
+        "Pinned host memory:",
+        args.pin_memory,
+    )
     print()
 
     # ----------------------------------------------------------------------
-    # Load reference and model
+    # Load reference frame. Each persistent worker builds its own model pair
+    # and extracts its own device-local copy of the fixed reference features.
     # ----------------------------------------------------------------------
     print("Loading fixed reference frame...")
     reference_frame = read_reference_frame(
@@ -3466,34 +4077,44 @@ def main() -> None:
         f"{reference_scaled.shape[1]}x{reference_scaled.shape[0]}",
     )
 
-    print("Loading SuperPoint + LightGlue...")
-    extractor, matcher = build_models(
-        args,
-        device,
+    print(
+        "Starting persistent SuperPoint + LightGlue workers..."
     )
 
-    print("Extracting fixed reference features...")
-    reference_features = extract_features(
-        extractor,
-        reference_scaled,
-        device,
-    )
-
-    reference_unbatched = rbd(
-        reference_features
-    )
-    reference_keypoint_count = int(
-        reference_unbatched[
-            "keypoints"
-        ].shape[
-            0
-        ]
+    (
+        workers,
+        inference_task_queue,
+        inference_result_queue,
+        worker_stop_event,
+        worker_ready,
+        reference_keypoint_count,
+    ) = start_registration_workers(
+        devices=devices,
+        args=args,
+        reference_scaled=reference_scaled,
+        width=width,
+        height=height,
     )
 
     print(
         "Reference keypoints:",
         reference_keypoint_count,
     )
+
+    for worker_id in sorted(
+        worker_ready
+    ):
+        info = worker_ready[
+            worker_id
+        ]
+
+        print(
+            f"  worker {worker_id}: "
+            f"{info['device']} "
+            f"(reference keypoints="
+            f"{info['reference_keypoints']})"
+        )
+
     print()
 
     # ----------------------------------------------------------------------
@@ -3551,10 +4172,16 @@ def main() -> None:
     allowed_track_ids: set[int] = set()
 
     # ----------------------------------------------------------------------
-    # First pass: directly match samples to reference.
+    # First pass: directly match sampled frames to the fixed reference.
+    #
+    # The CPU decoder feeds one bounded shared queue. Persistent workers
+    # dynamically take jobs, so both GPUs remain busy without assigning a
+    # fixed frame sequence to either GPU. Results may finish out of order,
+    # but they are committed strictly by frame index before diagnostics,
+    # tracks, and transform interpolation.
     # ----------------------------------------------------------------------
     print("=" * 78)
-    print("PASS 1/2: DIRECT REFERENCE REGISTRATION")
+    print("PASS 1/2: PARALLEL DIRECT REFERENCE REGISTRATION")
     print("=" * 78)
 
     cap = cv2.VideoCapture(
@@ -3562,15 +4189,277 @@ def main() -> None:
     )
 
     if not cap.isOpened():
+        stop_registration_workers(
+            workers,
+            inference_task_queue,
+            worker_stop_event,
+            graceful=False,
+        )
         raise RuntimeError(
             f"Could not open video: {args.input}"
         )
 
     sample_records = []
+    sample_order = []
+    pending_results = {}
+    commit_position = 0
+    submitted_jobs = 0
+    received_jobs = 0
+
     frame_index = 0
     last_frame = None
     last_frame_index = -1
     sampled_indices_set = set()
+
+    total_workers = len(
+        workers
+    )
+
+    # Bound not only the task queue but also how far ordered commit may lag.
+    # This prevents a single slow early frame from allowing later completed
+    # full-resolution frames to accumulate without limit in RAM.
+    max_uncommitted_samples = max(
+        2,
+        total_workers
+        * (
+            args.prefetch
+            + 1
+        ),
+    )
+
+    pass_completed = False
+
+    def commit_ready_samples():
+        nonlocal commit_position
+
+        while commit_position < len(
+            sample_order
+        ):
+            next_frame_index = sample_order[
+                commit_position
+            ]
+
+            package = pending_results.get(
+                next_frame_index
+            )
+
+            if package is None:
+                break
+
+            del pending_results[
+                next_frame_index
+            ]
+
+            current_frame = package[
+                "frame"
+            ]
+            visual_result = package[
+                "result"
+            ]
+            worker_id = int(
+                package[
+                    "worker_id"
+                ]
+            )
+            worker_device = str(
+                package[
+                    "device"
+                ]
+            )
+
+            record = registration_result_to_record(
+                frame_index=next_frame_index,
+                result=visual_result,
+                reference_keypoint_count=reference_keypoint_count,
+                worker_id=worker_id,
+                worker_device=worker_device,
+            )
+
+            sample_records.append(
+                record
+            )
+
+            if diagnostic_writer is not None:
+                diagnostic_frame = render_registration_diagnostic(
+                    reference_frame=reference_frame,
+                    current_frame=current_frame,
+                    frame_index=next_frame_index,
+                    reference_index=args.reference_frame,
+                    result=visual_result,
+                    width=width,
+                    height=height,
+                    viz_width=viz_width,
+                    viz_height=viz_height,
+                    header_height=viz_header,
+                    args=args,
+                )
+                diagnostic_writer.write(
+                    diagnostic_frame
+                )
+
+            if (
+                tracks_writer is not None
+                and visual_result is not None
+            ):
+                update_track_histories(
+                    histories=track_histories,
+                    allowed_ids=allowed_track_ids,
+                    result=visual_result,
+                    maximum_ids=args.tracks_max_points,
+                    track_length=args.track_length,
+                )
+
+                tracks_frame = render_tracks(
+                    frame=current_frame,
+                    histories=track_histories,
+                    frame_index=next_frame_index,
+                    reference_index=args.reference_frame,
+                    width=width,
+                    height=height,
+                    viz_width=viz_width,
+                    viz_height=viz_height,
+                    args=args,
+                )
+                tracks_writer.write(
+                    tracks_frame
+                )
+
+            if (
+                args.progress_every > 0
+                and (
+                    next_frame_index
+                    % args.progress_every
+                    == 0
+                )
+            ):
+                print(
+                    f"frame={next_frame_index:8d}  "
+                    f"worker={worker_id:2d}  "
+                    f"device={worker_device:8s}  "
+                    f"valid={record['valid']}  "
+                    f"matches={record['matches']:5d}  "
+                    f"inliers={record['inliers']:5d}  "
+                    f"ratio={record['inlier_ratio']:.3f}  "
+                    f"rms={record['rms']:.3f}"
+                )
+
+            commit_position += 1
+
+    def receive_one_result(
+        block: bool,
+    ) -> bool:
+        nonlocal received_jobs
+
+        try:
+            if block:
+                message = inference_result_queue.get()
+            else:
+                message = inference_result_queue.get_nowait()
+
+        except queue.Empty:
+            return False
+
+        if message[
+            "kind"
+        ] == "error":
+            raise RuntimeError(
+                "Inference worker failed while processing a frame:\n"
+                f"worker={message['worker_id']} "
+                f"device={message['device']} "
+                f"frame={message['frame_index']}\n"
+                f"{message['error']}\n"
+                f"{message['traceback']}"
+            )
+
+        current_frame_index = int(
+            message[
+                "frame_index"
+            ]
+        )
+
+        if current_frame_index in pending_results:
+            raise RuntimeError(
+                f"Duplicate worker result for frame {current_frame_index}."
+            )
+
+        pending_results[
+            current_frame_index
+        ] = message
+
+        received_jobs += 1
+
+        commit_ready_samples()
+
+        return True
+
+    def drain_available_results():
+        while receive_one_result(
+            block=False
+        ):
+            pass
+
+    def wait_until_capacity():
+        while (
+            len(
+                sample_order
+            )
+            - commit_position
+        ) >= max_uncommitted_samples:
+            receive_one_result(
+                block=True
+            )
+
+    def enqueue_sample(
+        sample_frame_index: int,
+        sample_frame: np.ndarray,
+    ):
+        nonlocal submitted_jobs
+
+        wait_until_capacity()
+
+        sample_order.append(
+            int(
+                sample_frame_index
+            )
+        )
+        sampled_indices_set.add(
+            int(
+                sample_frame_index
+            )
+        )
+
+        if (
+            sample_frame_index
+            == args.reference_frame
+        ):
+            pending_results[
+                sample_frame_index
+            ] = {
+                "kind": "result",
+                "worker_id": -1,
+                "device": "reference",
+                "frame_index": int(
+                    sample_frame_index
+                ),
+                "frame": sample_frame,
+                "result": None,
+            }
+
+            commit_ready_samples()
+
+        else:
+            inference_task_queue.put(
+                (
+                    int(
+                        sample_frame_index
+                    ),
+                    sample_frame,
+                )
+            )
+
+            submitted_jobs += 1
+
+        drain_available_results()
 
     try:
         while True:
@@ -3595,152 +4484,10 @@ def main() -> None:
             )
 
             if should_sample:
-                sampled_indices_set.add(
-                    frame_index
+                enqueue_sample(
+                    frame_index,
+                    frame,
                 )
-
-                if frame_index == args.reference_frame:
-                    record = {
-                        "frame_index": frame_index,
-                        "valid": True,
-                        "reason": "reference identity",
-                        "H": np.eye(
-                            3,
-                            dtype=np.float64,
-                        ),
-                        "matches": reference_keypoint_count,
-                        "inliers": reference_keypoint_count,
-                        "inlier_ratio": 1.0,
-                        "rms": 0.0,
-                    }
-
-                    visual_result = None
-
-                else:
-                    visual_result = match_sample_to_reference(
-                        frame=frame,
-                        reference_features=reference_features,
-                        extractor=extractor,
-                        matcher=matcher,
-                        device=device,
-                        args=args,
-                        width=width,
-                        height=height,
-                    )
-
-                    record = {
-                        "frame_index": frame_index,
-                        "valid": bool(
-                            visual_result[
-                                "valid"
-                            ]
-                        ),
-                        "reason": str(
-                            visual_result[
-                                "reason"
-                            ]
-                        ),
-                        "H": (
-                            visual_result[
-                                "H"
-                            ]
-                            if visual_result[
-                                "H"
-                            ] is not None
-                            else np.full(
-                                (
-                                    3,
-                                    3,
-                                ),
-                                np.nan,
-                                dtype=np.float64,
-                            )
-                        ),
-                        "matches": int(
-                            visual_result[
-                                "matches"
-                            ]
-                        ),
-                        "inliers": int(
-                            visual_result[
-                                "inliers"
-                            ]
-                        ),
-                        "inlier_ratio": float(
-                            visual_result[
-                                "inlier_ratio"
-                            ]
-                        ),
-                        "rms": float(
-                            visual_result[
-                                "rms"
-                            ]
-                        ),
-                    }
-
-                sample_records.append(
-                    record
-                )
-
-                if diagnostic_writer is not None:
-                    diagnostic_frame = render_registration_diagnostic(
-                        reference_frame=reference_frame,
-                        current_frame=frame,
-                        frame_index=frame_index,
-                        reference_index=args.reference_frame,
-                        result=visual_result,
-                        width=width,
-                        height=height,
-                        viz_width=viz_width,
-                        viz_height=viz_height,
-                        header_height=viz_header,
-                        args=args,
-                    )
-                    diagnostic_writer.write(
-                        diagnostic_frame
-                    )
-
-                if (
-                    tracks_writer is not None
-                    and visual_result is not None
-                ):
-                    update_track_histories(
-                        histories=track_histories,
-                        allowed_ids=allowed_track_ids,
-                        result=visual_result,
-                        maximum_ids=args.tracks_max_points,
-                        track_length=args.track_length,
-                    )
-
-                    tracks_frame = render_tracks(
-                        frame=frame,
-                        histories=track_histories,
-                        frame_index=frame_index,
-                        reference_index=args.reference_frame,
-                        width=width,
-                        height=height,
-                        viz_width=viz_width,
-                        viz_height=viz_height,
-                        args=args,
-                    )
-                    tracks_writer.write(
-                        tracks_frame
-                    )
-
-                if (
-                    args.progress_every > 0
-                    and frame_index
-                    % args.progress_every
-                    == 0
-                ):
-                    print(
-                        f"frame={frame_index:8d}  "
-                        f"valid={record['valid']}  "
-                        f"matches={record['matches']:5d}  "
-                        f"inliers={record['inliers']:5d}  "
-                        f"ratio={record['inlier_ratio']:.3f}  "
-                        f"rms={record['rms']:.3f}"
-                    )
 
             frame_index += 1
 
@@ -3757,150 +4504,54 @@ def main() -> None:
                 f"actual decoded frame count {num_frames}."
             )
 
-        # Force an absolute direct-reference anchor on the final frame.
+        # Force a direct absolute reference registration on the final frame.
         if (
             last_frame_index >= 0
             and last_frame_index
             not in sampled_indices_set
         ):
-            final_result = (
-                None
-                if last_frame_index
-                == args.reference_frame
-                else match_sample_to_reference(
-                    frame=last_frame,
-                    reference_features=reference_features,
-                    extractor=extractor,
-                    matcher=matcher,
-                    device=device,
-                    args=args,
-                    width=width,
-                    height=height,
-                )
+            enqueue_sample(
+                last_frame_index,
+                last_frame,
             )
 
-            if final_result is None:
-                final_record = {
-                    "frame_index": last_frame_index,
-                    "valid": True,
-                    "reason": "reference identity",
-                    "H": np.eye(
-                        3,
-                        dtype=np.float64,
-                    ),
-                    "matches": reference_keypoint_count,
-                    "inliers": reference_keypoint_count,
-                    "inlier_ratio": 1.0,
-                    "rms": 0.0,
-                }
-            else:
-                final_record = {
-                    "frame_index": last_frame_index,
-                    "valid": bool(
-                        final_result[
-                            "valid"
-                        ]
-                    ),
-                    "reason": str(
-                        final_result[
-                            "reason"
-                        ]
-                    ),
-                    "H": (
-                        final_result[
-                            "H"
-                        ]
-                        if final_result[
-                            "H"
-                        ] is not None
-                        else np.full(
-                            (
-                                3,
-                                3,
-                            ),
-                            np.nan,
-                            dtype=np.float64,
-                        )
-                    ),
-                    "matches": int(
-                        final_result[
-                            "matches"
-                        ]
-                    ),
-                    "inliers": int(
-                        final_result[
-                            "inliers"
-                        ]
-                    ),
-                    "inlier_ratio": float(
-                        final_result[
-                            "inlier_ratio"
-                        ]
-                    ),
-                    "rms": float(
-                        final_result[
-                            "rms"
-                        ]
-                    ),
-                }
-
-            sample_records.append(
-                final_record
-            )
-
-            if diagnostic_writer is not None:
-                diagnostic_frame = render_registration_diagnostic(
-                    reference_frame=reference_frame,
-                    current_frame=last_frame,
-                    frame_index=last_frame_index,
-                    reference_index=args.reference_frame,
-                    result=final_result,
-                    width=width,
-                    height=height,
-                    viz_width=viz_width,
-                    viz_height=viz_height,
-                    header_height=viz_header,
-                    args=args,
-                )
-                diagnostic_writer.write(
-                    diagnostic_frame
-                )
-
-            if (
-                tracks_writer is not None
-                and final_result is not None
+        # All jobs are submitted. Finish receiving and commit strictly in
+        # temporal sample order, regardless of which GPU completed first.
+        while commit_position < len(
+            sample_order
+        ):
+            if not receive_one_result(
+                block=False
             ):
-                update_track_histories(
-                    histories=track_histories,
-                    allowed_ids=allowed_track_ids,
-                    result=final_result,
-                    maximum_ids=args.tracks_max_points,
-                    track_length=args.track_length,
+                receive_one_result(
+                    block=True
                 )
 
-                tracks_frame = render_tracks(
-                    frame=last_frame,
-                    histories=track_histories,
-                    frame_index=last_frame_index,
-                    reference_index=args.reference_frame,
-                    width=width,
-                    height=height,
-                    viz_width=viz_width,
-                    viz_height=viz_height,
-                    args=args,
-                )
-                tracks_writer.write(
-                    tracks_frame
-                )
+        if received_jobs != submitted_jobs:
+            raise RuntimeError(
+                f"Received {received_jobs} inference results but "
+                f"submitted {submitted_jobs} jobs."
+            )
+
+        pass_completed = True
 
     finally:
         cap.release()
 
-        if diagnostic_writer is not None:
-            diagnostic_writer.close()
+        try:
+            stop_registration_workers(
+                workers,
+                inference_task_queue,
+                worker_stop_event,
+                graceful=pass_completed,
+            )
+        finally:
+            if diagnostic_writer is not None:
+                diagnostic_writer.close()
 
-        if tracks_writer is not None:
-            tracks_writer.close()
+            if tracks_writer is not None:
+                tracks_writer.close()
+
 
     # Sort because reference-frame sampling or final insertion should never
     # be allowed to alter temporal anchor order.
@@ -3988,6 +4639,28 @@ def main() -> None:
             item[
                 "reason"
             ]
+            for item in sample_records
+        ],
+        dtype=np.str_,
+    )
+
+    sample_worker_ids = np.asarray(
+        [
+            item.get(
+                "worker_id",
+                -1,
+            )
+            for item in sample_records
+        ],
+        dtype=np.int32,
+    )
+
+    sample_worker_devices = np.asarray(
+        [
+            item.get(
+                "worker_device",
+                "unknown",
+            )
             for item in sample_records
         ],
         dtype=np.str_,
@@ -4427,6 +5100,8 @@ def main() -> None:
         sample_inlier_ratio=sample_inlier_ratio,
         sample_reprojection_rms=sample_rms,
         sample_reasons=sample_reasons,
+        sample_worker_ids=sample_worker_ids,
+        sample_worker_devices=sample_worker_devices,
         width=np.int32(
             width
         ),
@@ -4502,6 +5177,32 @@ def main() -> None:
                 "followed by projection back to the selected motion model"
             ),
         },
+        "parallel_inference": {
+            "devices": [
+                str(
+                    device
+                )
+                for device in devices
+            ],
+            "workers_per_device": int(
+                args.gpu_workers
+            ),
+            "total_workers": int(
+                len(
+                    workers
+                )
+            ),
+            "prefetch_per_worker": int(
+                args.prefetch
+            ),
+            "pin_memory": bool(
+                args.pin_memory
+            ),
+            "shared_dynamic_task_queue": True,
+            "ordered_result_commit": True,
+            "one_model_pair_per_worker": True,
+            "one_reference_feature_copy_per_worker": True,
+        },
         "superpoint": {
             "max_keypoints": int(
                 args.max_keypoints
@@ -4531,7 +5232,10 @@ def main() -> None:
             ),
             "mixed_precision": bool(
                 args.amp
-                and device.type == "cuda"
+                and any(
+                    device.type == "cuda"
+                    for device in devices
+                )
             ),
             "compiled": bool(
                 args.compile_lightglue
@@ -4681,6 +5385,22 @@ def main() -> None:
     )
     print()
     print(
+        "Inference devices:",
+        " ".join(
+            str(
+                device
+            )
+            for device in devices
+        ),
+    )
+    print(
+        "Inference workers:",
+        len(
+            workers
+        ),
+    )
+    print()
+    print(
         "No sequential motion transform was accumulated: "
         "all sampled transforms were estimated directly against "
         f"reference frame {args.reference_frame}."
@@ -4689,4 +5409,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()  
+    main()
