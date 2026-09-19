@@ -513,7 +513,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--codec",
-        default="hvec_nvenc",
+        default="hevc_nvenc",
         help="Stabilized video codec.",
     )
     parser.add_argument(
@@ -605,7 +605,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--viz-codec",
-        default="hvec_nvenc",
+        default="hevc_nvenc",
         help="Diagnostic/track visualization video codec.",
     )
     parser.add_argument(
