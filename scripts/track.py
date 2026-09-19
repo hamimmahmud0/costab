@@ -1,4 +1,5 @@
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from collections import deque
 
@@ -199,6 +200,14 @@ print("step:", step)
 print("window:", window_size)
 
 
+# One long-lived CPU worker per GPU. Reusing the pool avoids creating
+# threads for every online chunk.
+executor = ThreadPoolExecutor(
+    max_workers=2,
+    thread_name_prefix="cotracker-gpu",
+)
+
+
 # ============================================================
 # Open video
 # ============================================================
@@ -360,6 +369,7 @@ def make_video_tensor(frames):
         .unsqueeze(0)
         .float()
         .contiguous()
+        .pin_memory()
     )
 
     return video_cpu
@@ -381,10 +391,31 @@ def make_video_tensor(frames):
 #   - prepares tracking
 # ============================================================
 
+def _initialize_one_tracker(tracker, video, query, device):
+    with torch.cuda.device(device):
+        return tracker(
+            video_chunk=video,
+            is_first_step=True,
+            queries=query,
+            grid_size=0,
+        )
+
+
+def _process_one_tracker(tracker, video, device):
+    with torch.cuda.device(device):
+        return tracker(
+            video_chunk=video,
+        )
+
+
 def initialize_trackers(frames):
 
     video_cpu = make_video_tensor(frames)
 
+    # Pinned host memory + non_blocking=True lets both H2D copies be
+    # queued asynchronously. Each model call is then submitted from a
+    # separate CPU worker so CUDA work can be launched on both devices
+    # at the same time.
     video0 = video_cpu.to(
         DEVICES[0],
         non_blocking=True,
@@ -395,20 +426,24 @@ def initialize_trackers(frames):
         non_blocking=True,
     )
 
-
-    result0 = tracker0(
-        video_chunk=video0,
-        is_first_step=True,
-        queries=queries0,
-        grid_size=0,
+    future0 = executor.submit(
+        _initialize_one_tracker,
+        tracker0,
+        video0,
+        queries0,
+        DEVICES[0],
     )
 
-    result1 = tracker1(
-        video_chunk=video1,
-        is_first_step=True,
-        queries=queries1,
-        grid_size=0,
+    future1 = executor.submit(
+        _initialize_one_tracker,
+        tracker1,
+        video1,
+        queries1,
+        DEVICES[1],
     )
+
+    result0 = future0.result()
+    result1 = future1.result()
 
 
     # Current CoTracker online API should return
@@ -469,21 +504,29 @@ def process_chunk(frames):
 
 
     # --------------------------------------------------------
-    # Track GPU 0 points
+    # Track both point partitions concurrently.
+    #
+    # A separate CPU worker submits work to each CUDA device so one
+    # model's Python-side forward pass does not delay launch of the
+    # other model's kernels.
     # --------------------------------------------------------
 
-    tracks0, visibility0 = tracker0(
-        video_chunk=video0,
+    future0 = executor.submit(
+        _process_one_tracker,
+        tracker0,
+        video0,
+        DEVICES[0],
     )
 
-
-    # --------------------------------------------------------
-    # Track GPU 1 points
-    # --------------------------------------------------------
-
-    tracks1, visibility1 = tracker1(
-        video_chunk=video1,
+    future1 = executor.submit(
+        _process_one_tracker,
+        tracker1,
+        video1,
+        DEVICES[1],
     )
+
+    tracks0, visibility0 = future0.result()
+    tracks1, visibility1 = future1.result()
 
 
     if tracks0 is None or visibility0 is None:
@@ -1306,3 +1349,6 @@ print(
 )
 
 print("=" * 70)
+
+# Release worker threads after all tracking/output work is complete.
+executor.shutdown(wait=True)
