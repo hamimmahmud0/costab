@@ -3913,12 +3913,19 @@ def output_coordinate_transforms(
 # ============================================================================
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """Parse command-line arguments and run the stabilization pipeline."""
     parser = build_parser()
     args = parser.parse_args(argv)
     validate_args(
         parser,
         args,
     )
+
+    return run(args)
+
+
+def run(args: argparse.Namespace) -> int:
+    """Run stabilization with an already parsed and validated namespace."""
 
     if not args.input.is_file():
         raise FileNotFoundError(

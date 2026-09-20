@@ -1,0 +1,24 @@
+site_name: lgstab documentation
+site_description: Fixed-reference nadir video stabilization with SuperPoint and LightGlue
+repo_url: https://github.com/hamimmahmud0/costab
+docs_dir: docs
+strict: true
+
+nav:
+  - Home: index.md
+  - Installation: installation.md
+  - CLI reference: cli.md
+  - Python API: python-api.md
+  - Outputs and coordinates: outputs.md
+  - Examples: examples.md
+
+theme:
+  name: mkdocs
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - tables
+  - toc:
+      permalink: true

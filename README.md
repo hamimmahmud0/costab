@@ -5,6 +5,22 @@ SuperPoint and LightGlue to register sampled frames directly against one fixed
 reference frame, then writes stabilized video, transform matrices, metadata,
 and optional diagnostic visualizations.
 
+## Documentation
+
+- [Documentation home](docs/index.md)
+- [Installation](docs/installation.md)
+- [CLI reference](docs/cli.md)
+- [Python API](docs/python-api.md)
+- [Outputs and coordinates](docs/outputs.md)
+- [Complete examples](docs/examples.md)
+
+Build the linked documentation site with:
+
+```bash
+python -m pip install -e '.[docs]'
+mkdocs serve
+```
+
 ## Requirements
 
 - Python 3.10 or newer
