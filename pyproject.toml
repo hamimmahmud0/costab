@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lgstab"
+version = "0.1.0"
+description = "Fixed-reference nadir video stabilization with SuperPoint and LightGlue"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "hamimmahmud0" },
+]
+dependencies = [
+  "lightglue @ git+https://github.com/hamimmahmud0/LightGlue.git@eb42fee2d71449efb0aa5c10549752b5d75384d8",
+  "numpy>=1.24",
+  "opencv-python>=4.8",
+  "PyYAML>=6.0",
+  "torch>=2.0",
+]
+
+[project.scripts]
+lgstab = "lgstab.stabilize:main"
+
+[project.urls]
+Repository = "https://github.com/hamimmahmud0/costab"
+
+[tool.setuptools]
+packages = ["lgstab"]
+package-dir = { lgstab = "scripts/superpoint" }

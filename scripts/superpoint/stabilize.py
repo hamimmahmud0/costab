@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-stabilize_nadir.py
+lgstab
 
 Fixed-reference stabilization for stationary nadir video using:
     SuperPoint + LightGlue + robust geometric registration.
@@ -40,13 +40,14 @@ For a point p=(x,y) detected in raw frame t:
 
 This is useful for vehicle trajectory extraction.
 
-Example
--------
-python stabilize_nadir.py \
+Examples
+--------
+lgstab \
     -i assets/nadir.mp4 \
-    -r intersection_01
+    -r intersection_01 \
+    --devices cuda:0
 
-python stabilize_nadir.py \
+lgstab \
     -i assets/nadir.mp4 \
     -r intersection_01 \
     -s 4 \
@@ -69,6 +70,7 @@ import sys
 import threading
 import traceback
 from collections import deque
+from collections.abc import Sequence
 from pathlib import Path
 
 import cv2
@@ -3910,9 +3912,9 @@ def output_coordinate_transforms(
 # Main pipeline
 # ============================================================================
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     validate_args(
         parser,
         args,
@@ -5407,6 +5409,8 @@ def main() -> None:
     )
     print("=" * 78)
 
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

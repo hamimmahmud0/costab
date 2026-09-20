@@ -1,6 +1,10 @@
-.pt
-.pth
-.mp4
+*.pt
+*.pth
+*.mp4
 assets/
-.venv
-runs
+.venv/
+runs/
+build/
+dist/
+*.egg-info/
+__pycache__/
